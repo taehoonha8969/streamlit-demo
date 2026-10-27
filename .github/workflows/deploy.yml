@@ -1,4 +1,4 @@
-name: Streamlit 배포
+name: Streamlit 자동 배포
 
 on:
   push:
@@ -14,14 +14,69 @@ jobs:
   deploy:
     if: github.ref == 'refs/heads/main'
     runs-on: [self-hosted, Linux]
+    timeout-minutes: 10
+
     steps:
       - uses: actions/checkout@v4
 
       - name: 문법 검사
         run: python3 -m py_compile app.py
 
-      - name: WSL에 배포
+      - name: Streamlit 설치
+        run: |
+          test -x "$HOME/streamlit-env/bin/python" ||
+            python3 -m venv "$HOME/streamlit-env"
+          "$HOME/streamlit-env/bin/python" -m pip install streamlit
+
+      - name: 배포
         run: |
           mkdir -p "$HOME/streamlit-demo"
           cp app.py "$HOME/streamlit-demo/app.py.tmp"
           mv "$HOME/streamlit-demo/app.py.tmp" "$HOME/streamlit-demo/app.py"
+
+      - name: Streamlit 실행 및 확인
+        shell: bash
+        run: |
+          site="$HOME/streamlit-demo"
+          pid="$(cat "$site/app.pid" 2>/dev/null || true)"
+
+          # 이 앱이 실행 중이면 그대로 사용한다.
+          if ! { [[ "$pid" =~ ^[0-9]+$ ]] &&
+                 kill -0 "$pid" 2>/dev/null &&
+                 ps -p "$pid" -o args= | grep -Fq -- "$site/app.py"; }; then
+
+            # 다른 프로그램의 포트는 건드리지 않는다.
+            if ss -ltnH 'sport = :8501' | grep -q .; then
+              echo "8501 포트가 사용 중입니다. 기존 프로그램을 확인하세요."
+              exit 1
+            fi
+
+            cd "$site"
+            RUNNER_TRACKING_ID="" nohup \
+              "$HOME/streamlit-env/bin/python" -m streamlit run "$site/app.py" \
+              --server.address 127.0.0.1 \
+              --server.port 8501 \
+              --server.headless true \
+              --server.runOnSave true \
+              > "$site/streamlit.log" 2>&1 < /dev/null &
+
+            pid=$!
+            echo "$pid" > "$site/app.pid"
+          fi
+
+          # 실행에 실패했는데 배포 성공으로 표시되지 않도록 확인한다.
+          for attempt in {1..30}; do
+            if ! kill -0 "$pid" 2>/dev/null; then
+              tail -n 30 "$site/streamlit.log"
+              exit 1
+            fi
+            if curl --noproxy '*' -fsS \
+                http://127.0.0.1:8501/_stcore/health > /dev/null 2>&1; then
+              echo "실행 완료: http://localhost:8501"
+              exit 0
+            fi
+            sleep 1
+          done
+
+          tail -n 30 "$site/streamlit.log"
+          exit 1
